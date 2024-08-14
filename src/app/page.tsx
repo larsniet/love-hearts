@@ -6,7 +6,10 @@ export default async function Home(): Promise<JSX.Element> {
   let isLedOn = false;
 
   try {
-    const response = await fetch(`${baseUrl}/api/check-reachability`);
+    const response = await fetch(`${baseUrl}/api/check-reachability`, {
+      cache: "no-store",
+      next: { revalidate: 1000 },
+    });
     const data = await response.json();
     isReachable = data.reachable;
   } catch (error) {
@@ -14,7 +17,10 @@ export default async function Home(): Promise<JSX.Element> {
   }
 
   try {
-    const response = await fetch(`${baseUrl}/api/check-led-status`);
+    const response = await fetch(`${baseUrl}/api/check-led-status`, {
+      cache: "no-store",
+      next: { revalidate: 1000 },
+    });
     if (response.ok) {
       const data = await response.json();
       isLedOn = data.status === "on";
