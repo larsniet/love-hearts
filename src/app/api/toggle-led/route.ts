@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import mqttSingleton from "@/lib/mqttSingleton";
 
-export async function POST(request: NextRequest) {
+export async function POST(request: NextRequest): Promise<NextResponse> {
   const body = await request.json();
   console.log("API request received:", body);
 
@@ -10,11 +10,11 @@ export async function POST(request: NextRequest) {
     const { action } = body; // 'ON' or 'OFF'
     const topic = "home/lights/toggle";
 
-    return new Promise((resolve) => {
+    const response = await new Promise<NextResponse>((resolve) => {
       mqttSingleton.client.publish(
         topic,
         action,
-        { qos: 1 },
+        { qos: 1, retain: true },
         (error?: Error) => {
           if (error) {
             console.error("Error publishing MQTT message:", error);
@@ -32,6 +32,8 @@ export async function POST(request: NextRequest) {
         }
       );
     });
+
+    return response;
   } catch (error) {
     console.error("Error in toggle-led API:", error);
     return NextResponse.json(
