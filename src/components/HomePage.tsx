@@ -1,78 +1,68 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { FaHeart } from "react-icons/fa";
 
-const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000";
-
-interface HomePageProps {
-  initialReachable: boolean;
-  initialLedOn: boolean;
-}
-
-export default function HomePage({
-  initialReachable,
-  initialLedOn,
-}: HomePageProps): JSX.Element {
-  const [isReachable, setIsReachable] = useState(initialReachable);
-  const [isLedOn, setIsLedOn] = useState(initialLedOn);
-
-  const checkLedStatus = useCallback(async () => {
-    if (!isReachable) return;
-
-    try {
-      const response = await fetch(`${baseUrl}/api/check-led-status`);
-      if (response.ok) {
-        const data = await response.json();
-        setIsLedOn(data.status === "on");
-      }
-    } catch (error) {
-      console.error("Error checking LED status:", error);
-    }
-  }, [isReachable, setIsLedOn]);
-
-  const checkReachability = useCallback(async () => {
-    try {
-      const response = await fetch(`${baseUrl}/api/check-reachability`);
-      const data = await response.json();
-      if (data.reachable) {
-        setIsReachable(true);
-        checkLedStatus(); // Check LED status if reachable
-      } else {
-        setIsReachable(false);
-      }
-    } catch (error) {
-      setIsReachable(false);
-    }
-  }, [setIsReachable, checkLedStatus]);
+export default function HomePage(): JSX.Element {
+  const [isLedOn, setIsLedOn] = useState<boolean>(false);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
 
   const toggleLed = async () => {
-    if (!isReachable) return;
-
+    setIsLoading(true);
+    setIsLedOn((prev) => !prev);
+    const action = isLedOn ? "OFF" : "ON";
     try {
-      const response = await fetch(`${baseUrl}/api/toggle-led`);
+      const response = await fetch(`/api/toggle-led`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ action }),
+      });
       if (response.ok) {
-        setIsLedOn((prev) => !prev);
+        // State will be updated via polling
+      } else {
+        console.error("Failed to toggle LED");
       }
     } catch (error) {
       console.error("Error toggling LED:", error);
+    } finally {
+      setIsLoading(false);
     }
   };
 
+  // Poll for LED status
   useEffect(() => {
-    const interval = setInterval(checkReachability, 5000); // Check reachability every 5 seconds
+    const fetchLedStatus = async () => {
+      try {
+        const response = await fetch(`/api/check-led-status`);
+        if (response.ok) {
+          const data = await response.json();
+          const serverLedStatus = data.status === "ON";
+          setIsLedOn(serverLedStatus);
+        } else {
+          console.error("Failed to check LED status");
+        }
+      } catch (error) {
+        console.error("Error checking LED status:", error);
+      }
+    };
+
+    // Fetch immediately on mount
+    fetchLedStatus();
+
+    // Set up interval to poll every 2 seconds
+    const interval = setInterval(fetchLedStatus, 2000);
+
+    // Clean up on unmount
     return () => clearInterval(interval);
-  }, [checkReachability]);
+  }, []);
 
   return (
     <div className="mb-4">
-      {isReachable ? (
-        <button onClick={toggleLed} className="text-4xl">
-          <FaHeart className={isLedOn ? "text-red-500" : "text-gray-500"} />
-        </button>
-      ) : (
-        <span className="text-red-500 font-bold">Device Unreachable</span>
-      )}
+      <button onClick={toggleLed} disabled={isLoading} className="text-4xl">
+        <FaHeart className={isLedOn ? "text-red-500" : "text-gray-500"} />
+      </button>
     </div>
   );
 }

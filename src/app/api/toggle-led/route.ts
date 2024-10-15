@@ -1,25 +1,42 @@
-export const dynamic = "force-dynamic";
+// /app/api/toggle-led/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import mqttSingleton from "@/lib/mqttSingleton";
 
-const espIp = process.env.ESP_IP ?? "192.168.0.72:8855";
+export async function POST(request: NextRequest) {
+  const body = await request.json();
+  console.log("API request received:", body);
 
-export async function GET() {
   try {
-    const response = await fetch(`http://${espIp}/toggle`, {
-      cache: "no-store",
-      next: { revalidate: 0 },
+    const { action } = body; // 'ON' or 'OFF'
+    const topic = "home/lights/toggle";
+
+    return new Promise((resolve) => {
+      mqttSingleton.client.publish(
+        topic,
+        action,
+        { qos: 1 },
+        (error?: Error) => {
+          if (error) {
+            console.error("Error publishing MQTT message:", error);
+            resolve(
+              NextResponse.json(
+                { success: false, error: "MQTT publish error" },
+                { status: 500 }
+              )
+            );
+          } else {
+            // Update LED state
+            mqttSingleton.isLedOn = action === "ON";
+            resolve(NextResponse.json({ success: true }, { status: 200 }));
+          }
+        }
+      );
     });
-    if (response.ok) {
-      return new Response(JSON.stringify({ success: true }), {
-        status: 200,
-      });
-    } else {
-      return new Response(JSON.stringify({ error: "Failed to toggle LED" }), {
-        status: 500,
-      });
-    }
   } catch (error) {
-    return new Response(JSON.stringify({ error: "Error toggling LED" }), {
-      status: 500,
-    });
+    console.error("Error in toggle-led API:", error);
+    return NextResponse.json(
+      { success: false, error: "Internal server error" },
+      { status: 500 }
+    );
   }
 }
