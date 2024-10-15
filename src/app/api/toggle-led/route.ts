@@ -2,6 +2,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import mqttSingleton from "@/lib/mqttSingleton";
 
+export const dynamic = "force-dynamic";
+
 export async function POST(request: NextRequest): Promise<NextResponse> {
   const body = await request.json();
   console.log("API request received:", body);
