@@ -1,225 +1,197 @@
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
-#include <WiFiManager.h>
+// love-lamp -- two (or more) ESP32 lamps that mirror one light state.
+//
+// Press the button on any heart and every heart follows, over MQTT. The same
+// binary runs on every board: identity is derived from the chip's own eFuse MAC
+// at runtime, and broker credentials live in NVS, provisioned once through the
+// Wi-Fi config portal. There is nothing to edit between the two uploads.
+//
+// Task split:
+//   loop()  (core 1)  button + lamp. Never touches the network, so the button
+//                     stays instant even while TLS is stalled.
+//   netTask (core 0)  Wi-Fi, TLS, MQTT, the connection state machine.
+// They meet only through gIntentQ and the mutex in state.cpp.
+//
+// Gestures (acted on release; the lamp blips as each threshold is crossed):
+//   tap            toggle
+//   2 s            pairing window   (Stage B -- inert for now)
+//   5 s            Wi-Fi portal
+//   11 s           factory reset
+//   20 s+          abort
+//
+// Flashing: ESP32 Dev Module, 115200 monitor. Keep "Erase All Flash Before
+// Sketch Upload" DISABLED and never change the Partition Scheme -- either one
+// wipes NVS and de-provisions the lamp.
 
-// MQTT broker details
-const char* mqtt_server = "<mqtt-server-ip>";
-const int mqtt_port = "<mqtt-server-port>";
+#include "button.h"
+#include "config.h"
+#include "defaults.h"
+#include "lamp.h"
+#include "net.h"
+#include "protocol.h"
+#include "state.h"
+#include "store.h"
 
-// MQTT authentication
-const char* mqtt_user = "<mqtt-username>";
-const char* mqtt_password = "<mqtt-password>";
+#include <esp_system.h>
 
-// Unique client ID for each ESP32
-const char* client_id = "<client-id-1>";
+// A stored ON restored after a power-on reset might be days old. We light it
+// immediately so the lamp looks right, then re-check once SNTP gives us a
+// clock. Our own recovery reboots skip this entirely -- a self-heal must be
+// invisible to the user.
+static bool sBootGatePending = false;
+static uint32_t sBootStoredTs = 0;
+static uint32_t sBootGateStartMs = 0;
 
-// MQTT topic to publish and subscribe
-const char* mqtt_topic = "<mqtt-topic>";
+static const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int-wdt";
+    case ESP_RST_TASK_WDT: return "task-wdt";
+    case ESP_RST_WDT: return "other-wdt";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    default: return "unknown";
+  }
+}
 
-const char* ca_cert = \
-"-----BEGIN CERTIFICATE-----\n" \
-"............................................\n" \
-"-----END CERTIFICATE-----\n";
+static void restoreBootState() {
+  esp_reset_reason_t rr = esp_reset_reason();
+  bool storedOn = storeLightOn();
+  sBootStoredTs = storeLightTs();
 
-WiFiClientSecure espClient;
-PubSubClient client(espClient);
-WiFiManager wm; 
+  if (!storedOn) {
+    logicalSet(false);
+    return;
+  }
 
-const int buttonPin = 12;  // GPIO pin connected to the button
-const int lightPin = 5;    // GPIO pin connected to the light
-bool lightState = false;   // Current state of the light
+  bool ourOwnReboot = (rr == ESP_RST_SW || rr == ESP_RST_PANIC ||
+                       rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT ||
+                       rr == ESP_RST_WDT);
 
-// Variables for button press handling
-unsigned long buttonPressTime = 0;
-bool buttonHeld = false;
-bool syncingMode = false;
+  logicalSet(true);
+  if (!ourOwnReboot) {
+    sBootGatePending = true;
+    sBootGateStartMs = millis();
+  }
+}
 
-// Variables for blinking light
-unsigned long previousMillis = 0;
-const long interval = 500; 
-bool ledState = LOW;
+static void bootGateTick() {
+  if (!sBootGatePending) return;
+
+  uint32_t now = epochOrZero();
+  if (now == 0) {
+    // No clock after a minute of trying: leave the lamp as it was rather than
+    // switching it off on a guess.
+    if (millis() - sBootGateStartMs > 60000) sBootGatePending = false;
+    return;
+  }
+
+  sBootGatePending = false;
+  if (sBootStoredTs != 0 && now > sBootStoredTs &&
+      (now - sBootStoredTs) > STALE_ON_WINDOW_S) {
+    Serial.println(F("[boot] stored ON is stale, switching off"));
+    logicalSet(false);
+    storeQueueState(false, now, seqNext());
+  }
+}
 
 void setup() {
   Serial.begin(115200);
+  delay(50);
 
-  // Initialize GPIO pins
-  pinMode(buttonPin, INPUT_PULLUP);  // Button with internal pull-up resistor
-  pinMode(lightPin, OUTPUT);
-  digitalWrite(lightPin, LOW);  // Light off initially
+  lampInit();
+  buttonInit();
+  identityInit();
+  storeInit();
 
-  // Connect to Wi-Fi
-  setup_wifi();
+  if (!stateInit()) {
+    // Without the queue and mutex the two-task split is unsafe. Better to
+    // reboot than to run with them missing.
+    Serial.println(F("[boot] state init failed, restarting"));
+    delay(2000);
+    ESP.restart();
+  }
 
-  // Configure MQTT client
-  espClient.setCACert(ca_cert);  // Load CA certificate
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-}
+  uint32_t boots = storeBumpBootCount();
+  restoreBootState();
+  netInit();
 
-void setup_wifi() {
-  delay(10);
   Serial.println();
-  Serial.print("Connecting to Wi-Fi... ");
+  Serial.println(F("=== love-lamp ==="));
+  Serial.printf("device   : %s (%s)\n", gDeviceId, gDeviceName);
+  Serial.printf("portal   : %s\n", gPortalSsid);
+  Serial.printf("group    : %s\n", gBroker.group);
+  Serial.printf("broker   : %s:%u%s\n", gBroker.host[0] ? gBroker.host : "(none)",
+                gBroker.port, brokerConfigured() ? "" : "  <- hold button 5s");
+  Serial.printf("light    : %s\n", logicalOn() ? "ON" : "OFF");
+  Serial.printf("reset    : %s   boot #%lu\n",
+                resetReasonName(esp_reset_reason()), (unsigned long)boots);
+  Serial.printf("heap     : free=%lu maxalloc=%lu\n",
+                (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)ESP.getMaxAllocHeap());
+  Serial.println(F("================="));
 
-  // Attempt to connect using saved credentials
-  WiFi.begin();
+  xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);
 
-  unsigned long startAttemptTime = millis();
-
-  // Try to connect for 10 seconds
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Connected to Wi-Fi");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("Failed to connect to Wi-Fi");
-    // Optionally, you can start the configuration portal here
-  }
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived on topic: ");
-  Serial.println(topic);
-
-  // Convert payload to string
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-
-  Serial.print("Message: ");
-  Serial.println(message);
-
-  // Toggle the light based on the message
-  if (message == "ON") {
-    lightState = true;
-    digitalWrite(lightPin, HIGH);
-  } else if (message == "OFF") {
-    lightState = false;
-    digitalWrite(lightPin, LOW);
-  }
-}
-
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection... ");
-    // Attempt to connect
-    if (client.connect(client_id, mqtt_user, mqtt_password)) {
-      Serial.println("connected");
-      // Once connected, subscribe
-      client.subscribe(mqtt_topic);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" - trying again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-  }
-}
-
-void startSyncingMode() {
-  Serial.println("Entering syncing mode");
-
-  // Reset saved Wi-Fi credentials
-  wm.resetSettings();
-
-  // Set the portal to non-blocking
-  wm.setConfigPortalBlocking(false);
-
-  // Start the configuration portal
-  wm.startConfigPortal("<device-name>");
-
-  // Indicate we're in syncing mode
-  syncingMode = true;
-}
-
-void blinkLight() {
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
-    // Toggle the LED
-    ledState = !ledState;
-    digitalWrite(lightPin, ledState ? HIGH : LOW);
-  }
+  // loop() now only debounces a button and writes a GPIO, so a 5 s stall
+  // genuinely means something is wrong. This is a real detector, not decoration.
+  enableLoopWDT();
 }
 
 void loop() {
-  // Read the button state
-  int buttonState = digitalRead(buttonPin);
+  switch (buttonTick()) {
+    case GESTURE_TOGGLE: {
+      bool on = !logicalOn();
+      logicalSet(on); // instant, before the network hears about it
+      ToggleIntent it = {on, seqNext(), epochOrZero()};
+      xQueueSend(gIntentQ, &it, 0);
+      Serial.printf("[btn] toggle -> %s\n", on ? "ON" : "OFF");
+      break;
+    }
 
-  // Handle button press
-  if (buttonState == LOW) {
-    if (!buttonHeld) {
-      // Button was just pressed
-      buttonHeld = true;
-      buttonPressTime = millis();
-    } else {
-      // Button is being held
-      if (millis() - buttonPressTime > 5000) {
-        // Button held for more than 5 seconds
-        if (!syncingMode) {
-          // Enter syncing mode
-          startSyncingMode();
-        }
-      }
-    }
-  } else {
-    if (buttonHeld) {
-      // Button was just released
-      buttonHeld = false;
-      if (!syncingMode && (millis() - buttonPressTime < 5000)) {
-        // Short press, toggle the light
-        Serial.println("Button pressed");
-        // Toggle the light state
-        lightState = !lightState;
-        // Update the light
-        digitalWrite(lightPin, lightState ? HIGH : LOW);
-        // Publish the new state
-        if (client.connected()) {
-          if (lightState) {
-            client.publish(mqtt_topic, "ON", true);
-          } else {
-            client.publish(mqtt_topic, "OFF", true);
-          }
-        }
-      }
-    }
+    case GESTURE_PAIR:
+      // Stage B. The threshold and its blip ship now so the gesture timings
+      // never shift under the user's fingers when pairing arrives.
+      Serial.println(F("[btn] pairing not available yet"));
+      lampFlashes(2, 120, 120);
+      break;
+
+    case GESTURE_PORTAL:
+      Serial.println(F("[btn] opening config portal"));
+      lampFlashes(3, 150, 150);
+      gWantPortal = true;
+      break;
+
+    case GESTURE_FACTORY:
+      Serial.println(F("[btn] factory reset requested"));
+      gWantFactoryReset = true;
+      break;
+
+    case GESTURE_ABORT:
+      Serial.println(F("[btn] gesture aborted"));
+      lampFlashes(1, 400, 200);
+      break;
+
+    default:
+      break;
   }
 
-  // If in syncing mode, process WiFiManager and blink the light
-  if (syncingMode) {
-    wm.process();     // Process WiFiManager portal
-    blinkLight();     // Blink the light
+  bootGateTick();
+  lampTick();
+  storeTick();
 
-    // Check if Wi-Fi is connected
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("Connected to new Wi-Fi network");
-      syncingMode = false;
-
-      // Reconnect MQTT client
-      reconnect();
-    }
-  } else {
-    // Ensure the light reflects the current state when not in syncing mode
-    digitalWrite(lightPin, lightState ? HIGH : LOW);
-
-    // Handle MQTT communication if Wi-Fi is connected
-    if (WiFi.status() == WL_CONNECTED) {
-      if (!client.connected()) {
-        reconnect();
-      }
-      client.loop();
-    } else {
-      // Wi-Fi is not connected
-      // Optionally, inform the user or attempt to reconnect
-    }
+  // netTask legitimately blocks for up to ~30 s inside a TLS connect, so the
+  // hardware watchdog would be wrong here; supervise it in software with 4x
+  // margin instead.
+  if (gNetHeartbeatMs != 0 &&
+      (millis() - gNetHeartbeatMs) > NET_HEARTBEAT_TIMEOUT_MS) {
+    Serial.println(F("[wdt] netTask wedged, restarting"));
+    storeFlush();
+    delay(100);
+    ESP.restart();
   }
+
+  delay(1);
 }
