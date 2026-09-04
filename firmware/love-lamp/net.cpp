@@ -195,6 +195,13 @@ static void enterWifiBackoff() {
 }
 
 static void startWifi() {
+  // The IDF driver refuses a fresh config while an attempt is still in flight
+  // ("E wifi:sta is connecting, cannot set config"), which would silently turn
+  // our backoff retry into a no-op -- it keeps scanning on the driver's own
+  // schedule instead of ours. Drop the in-flight attempt first. eraseap MUST
+  // stay false or this wipes the stored credentials.
+  if (WiFi.status() != WL_CONNECTED) WiFi.disconnect(false, false);
+
   // No arguments: with persistent(true) a begin() carrying credentials rewrites
   // the Wi-Fi NVS namespace every time, which at one retry a minute is
   // thousands of flash writes a day. Only WiFiManager passes credentials.
