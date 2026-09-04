@@ -4,118 +4,193 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Next.js web app that toggles a physical light. The web UI and an ESP32 device
-(`arduino/love-hearts.ino`) are two peers on the same MQTT topic — either can toggle the
-light, and both observe the change. Write-up: https://larsniet.com/journey/crafting-hello-kitty-diy-connected-lights
+ESP32 firmware for two or more networked lamps that mirror one light state over
+MQTT. Press the button on any heart and every heart follows.
 
-Note the package name is `lulu`, not `love-hearts`.
+`src/` holds an unmaintained Next.js app from the original build. **It is out of
+scope — do not modify it.** See *Legacy* at the bottom for what it did.
+
+The live code is `firmware/love-lamp/`.
 
 ## Commands
 
 ```bash
-pnpm dev      # dev server on :3000
-pnpm build    # production build
-pnpm start    # serve the production build
-pnpm lint     # next lint
+arduino-cli compile --profile esp32 firmware/love-lamp             # pinned build
+arduino-cli compile --profile esp32 --warnings all firmware/love-lamp
 ```
 
-There is no test suite and no test runner configured.
+`arduino-cli` is not on PATH. The IDE bundles a current copy (1.5.1) at
+`C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`,
+and it shares the IDE's installed cores and libraries by default, so no config
+is needed. A 20-second compile check is worth running before every commit — the
+sketch this repo shipped for two years never compiled at all.
 
-## Running commands from a Windows-side session
+There is no test suite. Verification is bench testing on real hardware; the
+checklist lives in the plan file, not here.
 
-This project lives on the WSL filesystem (`\\wsl.localhost\Ubuntu\home\larsv\projects\love-hearts`).
-If Claude Code is running on Windows, its shell is Git Bash and the commands above must be
-routed through `wsl.exe`. Three rules make that reliable:
+## Firmware
 
-```bash
-wsl.exe -d Ubuntu -- bash -ic 'pnpm lint'
+### Toolchain (pinned in `firmware/love-lamp/sketch.yaml`)
+
+| | |
+|---|---|
+| Core | `esp32:esp32` 3.3.11 |
+| FQBN | `esp32:esp32:esp32:PartitionScheme=min_spiffs` |
+| Libraries | PubSubClient 2.8, WiFiManager 2.0.17 |
+| Boards | COM3 and COM11 (COM8/COM9 are Bluetooth ports, not ESP32s) |
+
+The core jumped 3.0.5 → 3.3.11 on its own at some point; 3.0.5 is still cached
+at `%LOCALAPPDATA%\Arduino15\staging\packages\esp32-3.0.5.zip` if a regression
+ever needs bisecting. The pinned combination above is verified clean.
+
+`min_spiffs` is not optional. On the default 1.25 MB app partition the sketch is
+91% full once the CA root bundle links in; min_spiffs gives 1.9 MB and 61%.
+
+### Configuration is three tiers, and none of it differs between boards
+
+| Tier | Contents | Source |
+|---|---|---|
+| Identity | client id, portal SSID | derived from `ESP.getEfuseMac()` at runtime |
+| Secrets | broker host/port/user/pass, group | NVS, via the config portal |
+| Constants | pins, topics, timings | `config.h` |
+
+**Read this before proposing a change to identity.** Both boards previously
+shipped `client_id = "ESP32Client-1"`. MQTT brokers evict the existing session
+when a duplicate client id connects, so the two lamps kicked each other off
+continuously — the headline bug in this project's history. It was caused by
+*per-device build variants*: two sketch copies that had to be edited between
+uploads, and inevitably weren't.
+
+So identity is derived from the chip, not configured. Do not reintroduce a
+per-device build step, a MAC lookup table that supplies the client id, or two
+sketch folders. `DEVICE_PROFILES` in `config.h` supplies *cosmetic* names only,
+and the firmware must stay correct with that table empty. `ESP.getEfuseMac()` is
+used rather than `WiFi.macAddress()` because it reads the eFuse directly and so
+works before the Wi-Fi driver starts, which the hostname and portal SSID need.
+
+### Architecture
+
+Two tasks, and the split is load-bearing:
+
+- **`loop()` on core 1** owns the button and the lamp. Never touches the network.
+- **`netTask` on core 0** owns Wi-Fi, TLS, MQTT and the state machine.
+
+They meet only through `gIntentQ` and the mutex in `state.cpp`. **PubSubClient is
+not thread-safe — every `mqtt.*` call must stay on netTask.** `loop()` publishes
+by pushing a `ToggleIntent`.
+
+The reason is not elegance: `mqtt.connect()` can block ~165 s worst case (DNS +
+30 s TCP + 120 s TLS handshake + 15 s CONNACK). The old firmware's
+"non-blocking" reconnect only throttled how often it froze. `net.cpp` bounds
+this to ~30 s and puts it where nobody is waiting.
+
+Files: `net.cpp` (state machine, Wi-Fi events, bounded TLS, MQTT),
+`protocol.cpp` (payload codec + reconciliation), `state.cpp` (identity, shared
+state, Lamport counter), `store.cpp` (NVS), `button.cpp`, `lamp.cpp`.
+
+### Protocol
+
+Topics under `lovehearts/v1/<group>/`: `state` (retained), `heart/<id>/status`
+(retained, LWT), `heart/<id>/tele`. Payload is pipe-delimited, not JSON —
+ArduinoJson is deliberately absent because writing JSON is easy and *parsing* it
+is where the bugs are:
+
+```
+1|ON|heart-34AB12CD5678|97|1757001234
+ver state origin         seq epoch
 ```
 
-1. **Use `bash -ic`, not `bash -c`.** Node v24 and pnpm come from `nvm`, which is loaded from
-   `~/.bashrc` and only runs in an interactive shell. Without `-i` you get
-   `node: command not found`.
-2. **No `cd` needed.** WSL inherits the session's working directory, so the command already
-   starts in the project root.
-3. **Never use `$(...)` inside the quoted command.** Git Bash evaluates it on the Windows side
-   before `wsl.exe` sees it, so it silently runs against the wrong shell. Use plain commands, or
-   put the logic in a script file and run that.
+A bare `ON`/`OFF` is accepted as legacy v0. **PubSubClient's payload is not
+NUL-terminated** — always copy into a bounded buffer first; this is the most
+common crash in that library.
 
-`MSYS_NO_PATHCONV=1` and `MSYS2_ARG_CONV_EXCL=*` are set in `.claude/settings.local.json`
-(gitignored, so a fresh clone on Windows needs it recreated). Without
-them Git Bash rewrites POSIX arguments into Windows paths — `/home/larsv/foo` becomes
-`C:/Program Files/Git/home/larsv/foo`.
+Invariants worth not breaking:
 
-Windows `git` also needs the UNC path in `safe.directory` or it refuses the repo with
-"dubious ownership". That is already configured globally for this path.
+- **Receiving a state message never causes a publish.** Publishes come only from
+  a button press or the refresh timer. That one rule makes feedback loops
+  impossible regardless of how many hearts exist. The single exception is
+  suppressing a stale `ON`, which is terminal because an `OFF` cannot be
+  suppressed in turn.
+- **`OFF` is never age-gated; `ON` older than 6 h is not applied.** This is the
+  fix for a lamp lighting itself at 3am off a week-old retained message. Every
+  heart reaches the same conclusion independently.
+- **A local toggle is published before inbound is drained**, carrying a higher
+  Lamport sequence, so a stale retained value loses on merit rather than via a
+  timing hack. This is the fix for the lamp snapping back off after an offline
+  press.
+- `cleanSession = true` deliberately — a persistent session would queue a week of
+  toggles and replay them as a strobe.
 
-None of this applies when Claude Code runs inside WSL, which is the smoother setup:
+### Hardware notes
 
-```bash
-wsl -d Ubuntu -- bash -lic "cd ~/projects/love-hearts && claude"
-```
+Button GPIO12, light GPIO5, both strapping pins. GPIO12 is safe as wired
+(internal pull-down at reset, button shorts to ground) but **must never get an
+external pull-up** or the board won't boot. GPIO5 has an internal pull-up and
+glitches at boot, so the lamp flickers on every reset — accepted, no rewiring,
+which is why the recovery ladder in `net.cpp` prefers radio re-init and treats
+`ESP.restart()` as a last resort.
 
-## Environment
+### Two settings that wipe provisioning
 
-Copy `.env.example` to `.env`. Without it the MQTT client silently falls back to placeholder
-credentials (`your-public-domain.com`) and every request logs `ENOTFOUND` — the build still
-succeeds, so a passing `pnpm build` does not mean the broker is reachable.
+- **Tools → Erase All Flash Before Sketch Upload** must stay *Disabled*.
+- Don't change **Partition Scheme** after provisioning. (`default` and
+  `min_spiffs` happen to place `nvs` identically at `0x9000`/`0x5000`, so the
+  one switch this project made was free — but that is not true in general.)
 
-`MQTT_CA_FILE` is passed straight into `mqtt.connect()` as the `ca` option, so it holds
-certificate *contents*, not a path.
+### Secrets
 
-## Architecture
+**This repo is public.** `firmware/**/secrets.h` is gitignored and optional
+(`__has_include`), so a clean clone and CI both compile without it. Real broker
+credentials belong in NVS via the portal, never in a file.
 
-**The MQTT connection is a process-global singleton.** `src/lib/mqttSingleton.ts` connects at
-module load and stashes the client on `global.mqttSingleton` so Next's dev-mode module
-reloading doesn't open a new broker connection on every request. Anything needing MQTT imports
-this default export rather than calling `mqtt.connect()` again.
+Certificates are *not* secrets and don't belong in `secrets.h` either — the
+firmware validates against the Mozilla root bundle already compiled into the
+core (`setCACertBundle`). That retires the inline-PEM pattern that previously
+left one board carrying an expired CA. (Incidentally the ESP32 does not check
+certificate expiry at all: `CONFIG_MBEDTLS_HAVE_TIME_DATE` is unset in the
+prebuilt libs. The expired cert was a red herring; the real killers were the
+wrong password and the duplicate client id.)
 
-**Light state is in-memory, not persisted.** `mqttSingleton.isLedOn` is a plain boolean on that
-global. It is written from two places — the `message` handler when the broker echoes the topic,
-and `toggle-led` immediately after a successful publish. It resets to `false` on every server
-restart; the app recovers because messages are published with `retain: true`, so the broker
-replays the last value on reconnect.
+The old broker at `84.82.56.24:9883` is decommissioned. Credentials `lars`/`1602`
+that appear in git history and old sketchbook copies are dead strings.
 
-**State reaches the browser by polling, not push.** `HomePage.tsx` polls
-`/api/check-led-status` every 2s. The optimistic toggle is corrected by the next poll, so
-expect up to ~2s of lag after a hardware button press. There is no WebSocket or SSE.
+## Legacy: the Next.js app (unmaintained)
 
-Topic `home/lights/toggle` is hardcoded in both `mqttSingleton.ts` and `toggle-led/route.ts`;
-changing it means editing both plus the `.ino` sketch.
+Kept as the record of how the original build worked. Nothing should change here.
 
-All routes touching the singleton set `export const dynamic = "force-dynamic"` — required, or
-Next would prerender them at build time against a dead connection.
+A Next.js 14 App Router app (package name `lulu`) that toggled the lamp from a
+web UI. `pnpm dev` / `build` / `lint`, needs a `.env` from `.env.example`.
 
-### Auth
+- `src/lib/mqttSingleton.ts` connects at module load and stashes the client on
+  `global.mqttSingleton` so dev-mode module reloading doesn't reopen broker
+  connections. Light state was a plain boolean on that global, recovered after
+  restart only because messages were published with `retain: true`.
+- `src/components/HomePage.tsx` polled `/api/check-led-status` every 2 s — no
+  push, so hardware presses lagged ~2 s.
+- `src/middleware.ts` gated everything on one shared password, and
+  `api/login/route.ts` stored **the password itself verbatim as the cookie
+  value**.
+- All routes touching the singleton set `export const dynamic = "force-dynamic"`,
+  required or Next would prerender them against a dead connection.
 
-`src/middleware.ts` gates everything except `/login` and `/api/login` by comparing the `auth`
-cookie against `AUTH_PASSWORD`. There is one shared password and no user model. **The cookie
-value is the password itself, stored verbatim** (`login/route.ts`) — so any change to the auth
-scheme has to touch the middleware comparison and the cookie write together.
+It talks the legacy bare `ON`/`OFF` payload on `home/lights/toggle`, which the
+firmware no longer publishes — so it would need the topic and payload updated
+before it could work again. `MQTT_CA_FILE` in `.env.example` held certificate
+*contents*, not a path.
 
-The middleware `matcher` excludes `api`, but `/api/login` is *also* allowlisted inside the
-function body; both are load-bearing for different Next matching passes.
+Dead boilerplate in `src/` (`public/next.svg`, `public/vercel.svg`,
+`.text-balance`, the `./src/pages/**` Tailwind glob) is left alone deliberately —
+tidying a frozen subtree fixes nothing.
 
-### Hardware side
+## Notes
 
-`arduino/love-hearts.ino` is committed with placeholder credentials (`<mqtt-server-ip>` etc.)
-that must be filled in before flashing. It subscribes to the same topic and publishes `ON`/`OFF`
-with retain on a short button press. Holding the button 5s calls `wm.resetSettings()` and opens
-a WiFiManager captive portal — this wipes saved Wi-Fi credentials on the device.
+The repo used to live on the WSL filesystem for the Next.js toolchain and moved
+to `C:\Users\larsv\projects\love-hearts` once the app was frozen, since Arduino
+IDE is a Windows app and `arduino-cli` rejects UNC paths. WSL can still reach it
+at `/mnt/c/Users/larsv/projects/love-hearts` if the old app is ever revived.
 
-Both sides use `mqtts` (port 8883), but the server sets `rejectUnauthorized: false`, so TLS
-certificate errors will not surface as connection failures.
-
-## Conventions
-
-- `@/*` maps to `./src/*`.
-- App Router with route handlers under `src/app/api/`. Components live in `src/components/`,
-  not colocated with routes.
-- Tailwind for all styling; no CSS modules.
-
-## Other agent configs
-
-A Codex config exists at `~/.codex/config.toml`. To bring any of it into Claude Code, reply
-`/import` to scan and list what's importable (MCP servers, slash commands, subagents, skills,
-instructions), then `/import --yes=<digest>` using the digest the scan prints. If `/import`
-isn't available on this surface, run `claude import` from a terminal instead.
+A Codex config exists at `~/.codex/config.toml`. To bring any of it into Claude
+Code, reply `/import` to scan and list what's importable (MCP servers, slash
+commands, subagents, skills, instructions), then `/import --yes=<digest>` using
+the digest the scan prints. If `/import` isn't available on this surface, run
+`claude import` from a terminal instead.
