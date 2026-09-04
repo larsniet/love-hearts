@@ -6,6 +6,7 @@
 // fixed. Broker credentials live in NVS, never here -- see secrets.example.h.
 
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 // ---------------------------------------------------------------- hardware
@@ -51,6 +52,11 @@ static const uint8_t PROTO_VERSION = 1;
 
 // Longest line we will ever emit is well under this; see protocol.cpp.
 static const size_t PAYLOAD_MAX = 80;
+
+// Run the reconciliation-rule assertions at boot and print one summary line.
+// There is no host compiler on this machine to unit-test protoDecide off-target,
+// so it is checked on the device instead. Set to 0 to drop it from the build.
+#define PROTOCOL_SELFTEST 1
 
 // ---------------------------------------------------------------- timings
 
