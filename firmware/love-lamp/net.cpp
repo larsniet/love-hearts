@@ -6,6 +6,7 @@
 #include <WiFiManager.h>
 #include <esp_random.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
 #include <time.h>
 
 #include "button.h"
@@ -186,6 +187,29 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   }
 }
 
+// The SSID we are CONFIGURED to join, which is not the same question as
+// WiFi.SSID(): that one calls esp_wifi_sta_get_ap_info() and so reports the
+// *connected* AP, returning empty whenever we are disconnected. Reading it to
+// answer "do we have credentials?" gives a confident wrong answer.
+//
+// Also avoid WiFiManager's getWiFiIsSaved() here. It calls esp_wifi_get_config()
+// into an UNINITIALISED stack struct and ignores the return code
+// (WiFiManager.cpp, WiFi_SSID(true)), so a failed call reads stack garbage and
+// reports credentials that do not exist. Zero the struct, check the result.
+static bool storedSsid(char *out, size_t cap) {
+  out[0] = '\0';
+  wifi_config_t conf;
+  memset(&conf, 0, sizeof(conf));
+  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return false;
+  snprintf(out, cap, "%.32s", (const char *)conf.sta.ssid);
+  return out[0] != '\0';
+}
+
+static bool hasStoredWifi() {
+  char ssid[33];
+  return storedSsid(ssid, sizeof(ssid));
+}
+
 static void enterWifiBackoff() {
   uint32_t d = nextDelay(sWifiStage, WIFI_BACKOFF_BASE_MS, WIFI_BACKOFF_CAP_MS);
   sBackoffUntil = millis() + d;
@@ -206,6 +230,13 @@ static void startWifi() {
   // the Wi-Fi NVS namespace every time, which at one retry a minute is
   // thousands of flash writes a day. Only WiFiManager passes credentials.
   WiFi.begin();
+
+  // Which network are we actually reaching for? Without this, a "no-ap" is
+  // indistinguishable from "the router is off", "we moved house" and "someone
+  // renamed the SSID".
+  char ssid[33];
+  bool have = storedSsid(ssid, sizeof(ssid));
+  Serial.printf("[net] connecting to \"%s\"\n", have ? ssid : "(none stored)");
   sWifiStartMs = millis();
   gNetState = NET_WIFI_CONNECTING;
 }
@@ -689,7 +720,7 @@ void netTask(void *arg) {
 
     switch (gNetState) {
       case NET_BOOT:
-        if (!wm.getWiFiIsSaved()) {
+        if (!hasStoredWifi()) {
           Serial.println(F("[net] no saved Wi-Fi, opening portal"));
           startPortal();
         } else {
@@ -709,7 +740,15 @@ void netTask(void *arg) {
         if (sWifiUp) {
           gNetState = NET_MQTT_CONNECTING;
         } else if ((int32_t)(millis() - sBackoffUntil) >= 0) {
-          startWifi();
+          // Nothing to connect to. Retrying forever would leave an
+          // un-provisioned lamp blinking with no way in unless the owner
+          // happens to know about the button gesture -- open the portal instead.
+          if (!hasStoredWifi()) {
+            Serial.println(F("[net] still no credentials, opening portal"));
+            startPortal();
+          } else {
+            startWifi();
+          }
         }
         break;
 
