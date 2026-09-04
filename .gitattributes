@@ -1,0 +1,3 @@
+# core.autocrlf is on for this machine, which would check run.sh out with CRLF
+# and break it under bash ("bad interpreter: /usr/bin/env bash^M").
+*.sh text eol=lf

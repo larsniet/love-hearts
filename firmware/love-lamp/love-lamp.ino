@@ -28,6 +28,7 @@
 #include "lamp.h"
 #include "net.h"
 #include "protocol.h"
+#include "selftest.h"
 #include "state.h"
 #include "store.h"
 
@@ -132,6 +133,12 @@ void setup() {
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMaxAllocHeap());
   Serial.println(F("================="));
+
+  if (selfTestRun() != 0) {
+    // The reconciliation rules are wrong. The lamp will still work as a local
+    // switch, but flag it unmistakably rather than trusting the mirror logic.
+    lampFlashes(10, 80, 80);
+  }
 
   xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);
 
