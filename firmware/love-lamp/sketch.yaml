@@ -1,0 +1,26 @@
+# Pinned build profile.
+#
+#   arduino-cli compile --profile esp32
+#
+# Pinning is not hypothetical hygiene here: the ESP32 core on this machine
+# jumped 3.0.5 -> 3.3.11 on its own, and WiFiManager 2.0.17 predates 3.3.x.
+# The combination below is verified to build clean.
+#
+# PartitionScheme=min_spiffs is deliberate. The default 1.25 MB app partition
+# left the sketch at 91% full once the CA root bundle was linked in; min_spiffs
+# gives 1.9 MB and drops that to 61%, which is the headroom Stage B (ESP-NOW
+# pairing) will need. Both tables place nvs at 0x9000 size 0x5000, so switching
+# between them does NOT disturb provisioned credentials.
+#
+# In Arduino IDE, select: Tools > Partition Scheme > Minimal SPIFFS (1.9MB APP)
+
+profiles:
+  esp32:
+    fqbn: esp32:esp32:esp32:PartitionScheme=min_spiffs
+    platforms:
+      - platform: esp32:esp32 (3.3.11)
+    libraries:
+      - PubSubClient (2.8)
+      - WiFiManager (2.0.17)
+
+default_profile: esp32
