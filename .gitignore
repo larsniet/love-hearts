@@ -36,8 +36,9 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# claude code local settings
-.claude/settings.local.json
+# local editor/agent tooling, not shared
+.claude/
+CLAUDE.md
 
 # Arduino firmware
 firmware/**/secrets.h

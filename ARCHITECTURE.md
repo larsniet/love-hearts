@@ -1,6 +1,8 @@
-# CLAUDE.md
+# Architecture
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Engineering notes for this repository: how the firmware fits together, why the
+load-bearing decisions are what they are, and the traps that have already cost
+time once. Read before changing anything in `firmware/`.
 
 ## What this is
 
@@ -185,12 +187,9 @@ tidying a frozen subtree fixes nothing.
 ## Notes
 
 The repo used to live on the WSL filesystem for the Next.js toolchain and moved
-to `C:\Users\larsv\projects\love-hearts` once the app was frozen, since Arduino
-IDE is a Windows app and `arduino-cli` rejects UNC paths. WSL can still reach it
-at `/mnt/c/Users/larsv/projects/love-hearts` if the old app is ever revived.
+to the Windows filesystem once the app was frozen, since Arduino IDE is a
+Windows app and `arduino-cli` rejects UNC paths. WSL can still reach it under
+`/mnt/c/...` if the old app is ever revived.
 
-A Codex config exists at `~/.codex/config.toml`. To bring any of it into Claude
-Code, reply `/import` to scan and list what's importable (MCP servers, slash
-commands, subagents, skills, instructions), then `/import --yes=<digest>` using
-the digest the scan prints. If `/import` isn't available on this surface, run
-`claude import` from a terminal instead.
+The host-side protocol test (`firmware/test/run.sh`) needs `g++`; on Ubuntu or
+WSL that is `sudo apt-get install -y g++`.
